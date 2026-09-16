@@ -2,7 +2,7 @@ FROM golang:1.26.1 AS builder
 
 ARG TARGETPLATFORM
 
-COPY ./.git /app/.git
+#COPY ./.git /app/.git
 COPY ./build /app/build
 COPY ./cmd /app/cmd
 COPY ./dev-scripts /app/dev-scripts
