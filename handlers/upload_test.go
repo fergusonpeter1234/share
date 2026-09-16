@@ -162,6 +162,306 @@ func TestEntryPost(t *testing.T) {
 	}
 }
 
+func TestChunkedEntryUpload(t *testing.T) {
+	dataStore := test_sqlite.NewWithChunkSize(t, 5)
+	s := handlers.New(
+		mockAuthenticator{},
+		&dataStore,
+		nilSpaceChecker,
+		nilGarbageCollector,
+		mockClock{mustParseTime("2025-01-01T00:00:00Z")},
+	)
+
+	var uploadID string
+	{
+		requestBody := strings.NewReader(`{
+			"filename": "chunked.txt",
+			"contentType": "text/plain",
+			"expiration": "2040-01-01T00:00:00Z",
+			"size": 13
+		}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/entry/upload", requestBody)
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+
+		var response struct {
+			UploadID string `json:"uploadId"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		uploadID = response.UploadID
+	}
+
+	{
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/api/entry/upload/"+uploadID,
+			strings.NewReader("hello, "),
+		)
+		req.Header.Set("Content-Range", "bytes 0-6/13")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+
+		var response struct {
+			Offset uint64 `json:"offset"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		if got, want := response.Offset, uint64(7); got != want {
+			t.Errorf("offset=%d, want=%d", got, want)
+		}
+
+		if entries, err := dataStore.GetEntriesMetadata(); err != nil {
+			t.Fatalf("failed to list entries: %v", err)
+		} else if got, want := len(entries), 0; got != want {
+			t.Errorf("entry count after partial upload=%d, want=%d", got, want)
+		}
+	}
+
+	{
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/api/entry/upload/"+uploadID,
+			strings.NewReader("world!"),
+		)
+		req.Header.Set("Content-Range", "bytes 7-12/13")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+
+		var response handlers.EntryPostResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		if got, want := response.ID, uploadID; got != want {
+			t.Errorf("entry ID=%s, want=%s", got, want)
+		}
+	}
+
+	entry, err := dataStore.GetEntryMetadata(picoshare.EntryID(uploadID))
+	if err != nil {
+		t.Fatalf("failed to get completed entry: %v", err)
+	}
+	if got, want := entry.Filename, picoshare.Filename("chunked.txt"); got != want {
+		t.Errorf("filename=%s, want=%s", got, want)
+	}
+	if got, want := entry.ContentType, picoshare.ContentType("text/plain"); got != want {
+		t.Errorf("content type=%s, want=%s", got, want)
+	}
+
+	entryFile, err := dataStore.ReadEntryFile(entry.ID)
+	if err != nil {
+		t.Fatalf("failed to read completed entry: %v", err)
+	}
+	if got, want := mustReadAll(entryFile), []byte("hello, world!"); !reflect.DeepEqual(got, want) {
+		t.Errorf("stored contents=%s, want=%s", got, want)
+	}
+}
+
+func TestChunkedGuestUpload(t *testing.T) {
+	dataStore := test_sqlite.NewWithChunkSize(t, 5)
+	guestLink := picoshare.GuestLink{
+		ID:              picoshare.GuestLinkID("abcdefgh23456789"),
+		Created:         mustParseTime("2022-05-26T00:00:00Z"),
+		UrlExpires:      mustParseExpirationTime("2030-01-01T00:00:00Z"),
+		MaxFileUploads:  makeGuestUploadCountLimit(1),
+		MaxFileLifetime: picoshare.NewFileLifetimeInDays(1),
+	}
+	if err := dataStore.InsertGuestLink(guestLink); err != nil {
+		t.Fatalf("failed to insert guest link: %v", err)
+	}
+
+	s := handlers.New(
+		mockAuthenticator{},
+		&dataStore,
+		nilSpaceChecker,
+		nilGarbageCollector,
+		mockClock{mustParseTime("2025-01-01T00:00:00Z")},
+	)
+
+	var uploadID string
+	{
+		requestBody := strings.NewReader(`{
+			"filename": "guest-chunked.txt",
+			"contentType": "text/plain",
+			"size": 11
+		}`)
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/api/guest/abcdefgh23456789/upload",
+			requestBody,
+		)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+		var response struct {
+			UploadID string `json:"uploadId"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		uploadID = response.UploadID
+	}
+
+	{
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/api/guest/abcdefgh23456789/upload/"+uploadID,
+			strings.NewReader("hello"),
+		)
+		req.Header.Set("Content-Range", "bytes 0-4/11")
+		req.Header.Set("Accept", "application/json")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+	}
+
+	{
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/api/guest/abcdefgh23456789/upload/"+uploadID,
+			strings.NewReader(" world"),
+		)
+		req.Header.Set("Content-Range", "bytes 5-10/11")
+		req.Header.Set("Accept", "application/json")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+		var response handlers.EntryPostResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		if got, want := response.ID, uploadID; got != want {
+			t.Errorf("entry ID=%s, want=%s", got, want)
+		}
+	}
+
+	entry, err := dataStore.GetEntryMetadata(picoshare.EntryID(uploadID))
+	if err != nil {
+		t.Fatalf("failed to get completed guest entry: %v", err)
+	}
+	if got, want := entry.GuestLink.ID, guestLink.ID; got != want {
+		t.Errorf("guest link ID=%s, want=%s", got, want)
+	}
+	if got, want := entry.Expires, mustParseExpirationTime("2025-01-02T00:00:00Z"); got != want {
+		t.Errorf("expiration=%s, want=%s", got, want)
+	}
+
+	entryFile, err := dataStore.ReadEntryFile(entry.ID)
+	if err != nil {
+		t.Fatalf("failed to read completed guest entry: %v", err)
+	}
+	if got, want := string(mustReadAll(entryFile)), "hello world"; got != want {
+		t.Errorf("stored contents=%s, want=%s", got, want)
+	}
+}
+
+func TestChunkedEntryUploadRejectsShortChunk(t *testing.T) {
+	dataStore := test_sqlite.NewWithChunkSize(t, 5)
+	s := handlers.New(
+		mockAuthenticator{},
+		&dataStore,
+		nilSpaceChecker,
+		nilGarbageCollector,
+		mockClock{mustParseTime("2025-01-01T00:00:00Z")},
+	)
+
+	var uploadID string
+	{
+		requestBody := strings.NewReader(`{
+			"filename": "retryable.txt",
+			"expiration": "2040-01-01T00:00:00Z",
+			"size": 5
+		}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/entry/upload", requestBody)
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+		var response struct {
+			UploadID string `json:"uploadId"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		uploadID = response.UploadID
+	}
+
+	{
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/api/entry/upload/"+uploadID,
+			strings.NewReader("abc"),
+		)
+		req.Header.Set("Content-Range", "bytes 0-4/5")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusBadRequest; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+	}
+
+	{
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/api/entry/upload/"+uploadID,
+			strings.NewReader("abcde"),
+		)
+		req.Header.Set("Content-Range", "bytes 0-4/5")
+
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+
+		if got, want := rec.Code, http.StatusOK; got != want {
+			t.Fatalf("status=%d, want=%d", got, want)
+		}
+		var response handlers.EntryPostResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("response is not valid JSON: %v", err)
+		}
+		if got, want := response.ID, uploadID; got != want {
+			t.Errorf("entry ID=%s, want=%s", got, want)
+		}
+	}
+}
+
 func TestEntryPut(t *testing.T) {
 	originalEntry := picoshare.UploadMetadata{
 		ID:          picoshare.EntryID("AAAAAAAAAA"),

@@ -10,6 +10,8 @@ func (s *Server) routes() {
 	authenticatedApis := s.router.PathPrefix("/api").Subrouter()
 	authenticatedApis.Use(s.requireAuthentication)
 	authenticatedApis.HandleFunc("/entry", s.entryPost()).Methods(http.MethodPost)
+	authenticatedApis.HandleFunc("/entry/upload", s.entryUploadPost()).Methods(http.MethodPost)
+	authenticatedApis.HandleFunc("/entry/upload/{id}", s.entryUploadPatch()).Methods(http.MethodPatch)
 	authenticatedApis.HandleFunc("/entry/{id}", s.entryPut()).Methods(http.MethodPut)
 	authenticatedApis.HandleFunc("/entry/{id}", s.entryDelete()).Methods(http.MethodDelete)
 	authenticatedApis.HandleFunc("/guest-links", s.guestLinksPost()).Methods(http.MethodPost)
@@ -20,6 +22,8 @@ func (s *Server) routes() {
 
 	publicApis := s.router.PathPrefix("/api").Subrouter()
 	publicApis.HandleFunc("/guest/{guestLinkID}", s.guestEntryPost()).Methods(http.MethodPost)
+	publicApis.HandleFunc("/guest/{guestLinkID}/upload", s.guestEntryUploadPost()).Methods(http.MethodPost)
+	publicApis.HandleFunc("/guest/{guestLinkID}/upload/{id}", s.guestEntryUploadPatch()).Methods(http.MethodPatch)
 
 	static := s.router.PathPrefix("/").Subrouter()
 	static.PathPrefix("/css/").HandlerFunc(serveStaticResource()).Methods(http.MethodGet)

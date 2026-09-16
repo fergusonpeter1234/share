@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,7 +30,32 @@ type (
 	dbError struct {
 		Err error
 	}
+
+	entryUploadStartResponse struct {
+		UploadID string `json:"uploadId"`
+	}
+
+	entryUploadChunkResponse struct {
+		ID     string `json:"id,omitempty"`
+		Offset uint64 `json:"offset"`
+	}
+
+	entryUploadStartPayload struct {
+		Filename    string `json:"filename"`
+		ContentType string `json:"contentType"`
+		Expiration  string `json:"expiration"`
+		Note        string `json:"note"`
+		Size        uint64 `json:"size"`
+	}
+
+	entryUploadChunkRequest struct {
+		ID        picoshare.EntryID
+		ByteRange parse.ByteRange
+		Reader    io.Reader
+	}
 )
+
+const chunkedUploadChunkSize = store.MaximumEntryUploadChunkSize
 
 func (dbe dbError) Error() string {
 	return fmt.Sprintf("database error: %s", dbe.Err)
@@ -65,6 +91,268 @@ func (s Server) entryPost() http.HandlerFunc {
 
 		respondJSON(w, EntryPostResponse{ID: id.String()})
 	}
+}
+
+func (s Server) entryUploadPost() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		metadata, err := s.parseEntryUploadStartRequest(
+			r,
+			picoshare.GuestLinkID(""),
+			picoshare.ExpirationTime{},
+			false,
+		)
+		if err != nil {
+			log.Printf("invalid chunked upload: %v", err)
+			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		metadata.ID = generateEntryID()
+		if err := s.store.StartEntryUpload(metadata); err != nil {
+			if _, ok := errors.AsType[store.EntryUploadInvalidError](err); ok {
+				log.Printf("invalid chunked upload: %v", err)
+				http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+				return
+			}
+			log.Printf("failed to start chunked upload: %v", err)
+			http.Error(w, "failed to start upload", http.StatusInternalServerError)
+			return
+		}
+
+		respondJSON(w, entryUploadStartResponse{UploadID: metadata.ID.String()})
+	}
+}
+
+func (s Server) guestEntryUploadPost() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		guestLinkID, err := parseGuestLinkID(mux.Vars(r)["guestLinkID"])
+		if err != nil {
+			log.Printf("error parsing guest link ID: %v", err)
+			http.Error(w, fmt.Sprintf("Invalid guest link ID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		gl, err := s.store.GetGuestLink(guestLinkID)
+		if _, ok := errors.AsType[store.GuestLinkNotFoundError](err); ok {
+			http.Error(w, "Invalid guest link ID", http.StatusNotFound)
+			return
+		} else if err != nil {
+			log.Printf("error retrieving guest link with ID %v: %v", guestLinkID, err)
+			http.Error(w, "Failed to retrieve guest link", http.StatusInternalServerError)
+			return
+		}
+
+		if !gl.IsActiveAt(s.clock.Now()) {
+			http.Error(w, "Guest link is no longer active", http.StatusUnauthorized)
+			return
+		}
+
+		metadata, err := s.parseEntryUploadStartRequest(
+			r,
+			guestLinkID,
+			gl.MaxFileLifetime.ExpirationFromTime(s.clock.Now()),
+			true,
+		)
+		if err != nil {
+			log.Printf("invalid chunked guest upload: %v", err)
+			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		if gl.MaxFileBytes != picoshare.GuestUploadUnlimitedFileSize &&
+			metadata.Size.UInt64() > *gl.MaxFileBytes {
+			http.Error(w, "file exceeds guest link size limit", http.StatusBadRequest)
+			return
+		}
+
+		maxPermittedExpiration := gl.MaxFileLifetime.ExpirationFromTime(s.clock.Now())
+		if metadata.Expires.Time().After(maxPermittedExpiration.Time()) {
+			http.Error(w, "expiration exceeds guest link limit", http.StatusBadRequest)
+			return
+		}
+
+		metadata.ID = generateEntryID()
+		if err := s.store.StartEntryUpload(metadata); err != nil {
+			if _, ok := errors.AsType[store.EntryUploadInvalidError](err); ok {
+				log.Printf("invalid chunked guest upload: %v", err)
+				http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+				return
+			}
+			log.Printf("failed to start chunked guest upload: %v", err)
+			http.Error(w, "failed to start upload", http.StatusInternalServerError)
+			return
+		}
+
+		respondJSON(w, entryUploadStartResponse{UploadID: metadata.ID.String()})
+	}
+}
+
+func (s Server) entryUploadPatch() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.appendEntryUpload(w, r, picoshare.GuestLinkID(""))
+	}
+}
+
+func (s Server) guestEntryUploadPatch() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		guestLinkID, err := parseGuestLinkID(mux.Vars(r)["guestLinkID"])
+		if err != nil {
+			log.Printf("error parsing guest link ID: %v", err)
+			http.Error(w, fmt.Sprintf("Invalid guest link ID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		gl, err := s.store.GetGuestLink(guestLinkID)
+		if _, ok := errors.AsType[store.GuestLinkNotFoundError](err); ok {
+			http.Error(w, "Invalid guest link ID", http.StatusNotFound)
+			return
+		} else if err != nil {
+			log.Printf("error retrieving guest link with ID %v: %v", guestLinkID, err)
+			http.Error(w, "Failed to retrieve guest link", http.StatusInternalServerError)
+			return
+		}
+
+		if gl.IsDisabled || gl.IsExpiredAt(s.clock.Now()) {
+			http.Error(w, "Guest link is no longer active", http.StatusUnauthorized)
+			return
+		}
+
+		s.appendEntryUpload(w, r, guestLinkID)
+	}
+}
+
+func (s Server) appendEntryUpload(w http.ResponseWriter, r *http.Request, guestLinkID picoshare.GuestLinkID) {
+	r.Body = http.MaxBytesReader(w, r.Body, int64(chunkedUploadChunkSize)+1)
+	request, err := parseEntryUploadChunkRequest(r)
+	if err != nil {
+		log.Printf("invalid chunked upload request: %v", err)
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	complete, err := s.store.AppendEntryUpload(store.EntryUploadChunk{
+		ID:          request.ID,
+		GuestLinkID: guestLinkID,
+		Offset:      request.ByteRange.Start(),
+		Length:      request.ByteRange.Length(),
+		TotalSize:   request.ByteRange.Total(),
+		Reader:      request.Reader,
+	})
+	if err != nil {
+		if _, ok := errors.AsType[store.EntryNotFoundError](err); ok {
+			http.Error(w, "upload not found", http.StatusNotFound)
+			return
+		}
+		if _, ok := errors.AsType[store.EntryUploadOffsetError](err); ok {
+			http.Error(w, "unexpected upload offset", http.StatusConflict)
+			return
+		}
+		if _, ok := errors.AsType[store.EntryUploadInvalidError](err); ok {
+			log.Printf("invalid chunked upload: %v", err)
+			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("failed to save chunked upload: %v", err)
+		http.Error(w, "failed to save upload", http.StatusInternalServerError)
+		return
+	}
+
+	offset := request.ByteRange.End() + 1
+	if complete {
+		if guestLinkID != "" && !clientAcceptsJson(r) {
+			respondGuestUploadURL(w, r, request.ID)
+			return
+		}
+		respondJSON(w, entryUploadChunkResponse{
+			ID:     request.ID.String(),
+			Offset: offset,
+		})
+		return
+	}
+
+	respondJSON(w, entryUploadChunkResponse{Offset: offset})
+}
+
+func parseEntryUploadChunkRequest(r *http.Request) (entryUploadChunkRequest, error) {
+	id, err := parseEntryID(mux.Vars(r)["id"])
+	if err != nil {
+		return entryUploadChunkRequest{}, err
+	}
+
+	byteRange, err := parse.ParseByteRange(r.Header.Get("Content-Range"))
+	if err != nil {
+		return entryUploadChunkRequest{}, err
+	}
+	if byteRange.Length() > chunkedUploadChunkSize {
+		return entryUploadChunkRequest{}, fmt.Errorf("chunk exceeds maximum size")
+	}
+
+	return entryUploadChunkRequest{
+		ID:        id,
+		ByteRange: byteRange,
+		Reader:    r.Body,
+	}, nil
+}
+
+func (s Server) parseEntryUploadStartRequest(
+	r *http.Request,
+	guestLinkID picoshare.GuestLinkID,
+	defaultExpiration picoshare.ExpirationTime,
+	allowDefaultExpiration bool,
+) (picoshare.UploadMetadata, error) {
+	var payload entryUploadStartPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		return picoshare.UploadMetadata{}, err
+	}
+
+	filename, err := parse.Filename(payload.Filename)
+	if err != nil {
+		return picoshare.UploadMetadata{}, err
+	}
+
+	fileSize, err := picoshare.FileSizeFromUint64(payload.Size)
+	if err != nil {
+		return picoshare.UploadMetadata{}, err
+	}
+
+	contentType, err := parseContentType(payload.ContentType)
+	if err != nil {
+		return picoshare.UploadMetadata{}, err
+	}
+
+	note, err := parse.FileNote(payload.Note)
+	if err != nil {
+		return picoshare.UploadMetadata{}, err
+	}
+	if guestLinkID != "" && note.Value != nil {
+		return picoshare.UploadMetadata{}, errors.New("guest uploads cannot have file notes")
+	}
+
+	expiration := defaultExpiration
+	if payload.Expiration == "" {
+		if !allowDefaultExpiration {
+			expiration, err = parse.Expiration(payload.Expiration, s.clock.Now())
+			if err != nil {
+				return picoshare.UploadMetadata{}, err
+			}
+		}
+	} else {
+		expiration, err = parse.Expiration(payload.Expiration, s.clock.Now())
+		if err != nil {
+			return picoshare.UploadMetadata{}, err
+		}
+	}
+
+	return picoshare.UploadMetadata{
+		Filename:    filename,
+		ContentType: contentType,
+		Note:        note,
+		GuestLink:   picoshare.GuestLink{ID: guestLinkID},
+		Uploaded:    s.clock.Now(),
+		Expires:     expiration,
+		Size:        fileSize,
+	}, nil
 }
 
 func (s Server) entryPut() http.HandlerFunc {
@@ -149,13 +437,17 @@ func (s Server) guestEntryPost() http.HandlerFunc {
 		if clientAcceptsJson(r) {
 			respondJSON(w, EntryPostResponse{ID: id.String()})
 		} else {
-			// If client does not accept JSON, assume this is a command-line client
-			// and return plaintext.
-			w.Header().Set("Content-Type", "text/plain")
-			if _, err := fmt.Fprintf(w, "%s/-%s\r\n", baseURLFromRequest(r), id.String()); err != nil {
-				log.Fatalf("failed to write HTTP response: %v", err)
-			}
+			respondGuestUploadURL(w, r, id)
 		}
+	}
+}
+
+func respondGuestUploadURL(w http.ResponseWriter, r *http.Request, id picoshare.EntryID) {
+	// If client does not accept JSON, assume this is a command-line client and
+	// return plaintext.
+	w.Header().Set("Content-Type", "text/plain")
+	if _, err := fmt.Fprintf(w, "%s/-%s\r\n", baseURLFromRequest(r), id.String()); err != nil {
+		log.Fatalf("failed to write HTTP response: %v", err)
 	}
 }
 

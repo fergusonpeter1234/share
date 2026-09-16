@@ -11,6 +11,7 @@ import (
 
 	"github.com/mtlynch/picoshare/garbagecollect"
 	"github.com/mtlynch/picoshare/picoshare"
+	"github.com/mtlynch/picoshare/store"
 	"github.com/mtlynch/picoshare/store/test_sqlite"
 )
 
@@ -30,6 +31,51 @@ func TestCollectDoesNothingWhenStoreIsEmpty(t *testing.T) {
 	expected := []picoshare.UploadMetadata{}
 	if !reflect.DeepEqual(expected, remaining) {
 		t.Fatalf("unexpected results in datastore: got %+v, want %+v", remaining, expected)
+	}
+}
+
+func TestCollectStaleChunkedUpload(t *testing.T) {
+	dataStore := test_sqlite.New(t)
+	uploadID := picoshare.EntryID("PENDING001")
+	if err := dataStore.StartEntryUpload(picoshare.UploadMetadata{
+		ID:          uploadID,
+		Filename:    picoshare.Filename("partial.txt"),
+		ContentType: picoshare.ContentType("text/plain"),
+		Uploaded:    mustParseTime("2024-12-30T00:00:00Z"),
+		Expires:     picoshare.NeverExpire,
+		Size:        mustParseFileSize(7),
+	}); err != nil {
+		t.Fatalf("failed to start chunked upload: %v", err)
+	}
+
+	complete, err := dataStore.AppendEntryUpload(store.EntryUploadChunk{
+		ID:        uploadID,
+		Offset:    0,
+		Length:    3,
+		TotalSize: 7,
+		Reader:    strings.NewReader("abc"),
+	})
+	if err != nil {
+		t.Fatalf("failed to save partial upload: %v", err)
+	}
+	if got, want := complete, false; got != want {
+		t.Fatalf("upload complete=%t, want=%t", got, want)
+	}
+
+	c := garbagecollect.NewCollector(dataStore)
+	if err := c.Collect(); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	if _, err := dataStore.GetEntryMetadata(uploadID); err == nil {
+		t.Errorf("stale chunked upload remains visible")
+	}
+	remaining, err := dataStore.GetEntriesMetadata()
+	if err != nil {
+		t.Fatalf("failed to retrieve remaining entries: %v", err)
+	}
+	if got, want := len(remaining), 0; got != want {
+		t.Errorf("remaining entry count=%d, want=%d", got, want)
 	}
 }
 

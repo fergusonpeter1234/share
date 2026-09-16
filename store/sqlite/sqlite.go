@@ -13,7 +13,9 @@ import (
 const (
 	timeFormat = time.RFC3339
 	// I think Chrome reads in 32768 chunks, but I haven't checked rigorously.
-	defaultChunkSize = uint64(32768 * 10)
+	defaultChunkSize      = uint64(32768 * 10)
+	maxSQLiteInteger      = uint64(1<<63 - 1)
+	pendingUploadLifetime = 24 * time.Hour
 )
 
 type (

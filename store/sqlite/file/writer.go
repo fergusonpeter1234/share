@@ -8,19 +8,43 @@ import (
 )
 
 type writer struct {
-	ctx     wrapped.SqlDB
-	entryID picoshare.EntryID
-	buf     []byte
-	written int
+	ctx            wrapped.SqlDB
+	entryID        picoshare.EntryID
+	buf            []byte
+	written        uint64
+	updateExisting bool
 }
 
 // Create a new writer for the entry ID using the given SqlTx and splitting the
 // file into separate rows in the DB of at most chunkSize bytes.
 func NewWriter(ctx wrapped.SqlDB, id picoshare.EntryID, chunkSize uint64) io.WriteCloser {
+	return newWriterAt(ctx, id, chunkSize, 0, nil, false)
+}
+
+func NewWriterAt(
+	ctx wrapped.SqlDB,
+	id picoshare.EntryID,
+	chunkSize, offset uint64,
+	initialChunk []byte,
+) io.WriteCloser {
+	return newWriterAt(ctx, id, chunkSize, offset, initialChunk, true)
+}
+
+func newWriterAt(
+	ctx wrapped.SqlDB,
+	id picoshare.EntryID,
+	chunkSize, offset uint64,
+	initialChunk []byte,
+	updateExisting bool,
+) io.WriteCloser {
+	buf := make([]byte, chunkSize)
+	copy(buf, initialChunk)
 	return new(writer{
-		ctx:     ctx,
-		entryID: id,
-		buf:     make([]byte, chunkSize),
+		ctx:            ctx,
+		entryID:        id,
+		buf:            buf,
+		written:        offset,
+		updateExisting: updateExisting,
 	})
 }
 
@@ -39,7 +63,7 @@ func (w *writer) Write(p []byte) (int, error) {
 		if n == len(p) {
 			break
 		}
-		dstStart := w.written % len(w.buf)
+		dstStart := int(w.written % uint64(len(w.buf)))
 		copySize := min(len(w.buf)-dstStart, len(p)-n)
 		dstEnd := dstStart + copySize
 		copy(w.buf[dstStart:dstEnd], p[n:n+copySize])
@@ -48,7 +72,7 @@ func (w *writer) Write(p []byte) (int, error) {
 				return n, err
 			}
 		}
-		w.written += copySize
+		w.written += uint64(copySize)
 		n += copySize
 	}
 
@@ -56,7 +80,7 @@ func (w *writer) Write(p []byte) (int, error) {
 }
 
 func (w *writer) Close() error {
-	unflushed := w.written % len(w.buf)
+	unflushed := int(w.written % uint64(len(w.buf)))
 	if unflushed != 0 {
 		return w.flush(unflushed)
 	}
@@ -64,8 +88,8 @@ func (w *writer) Close() error {
 }
 
 func (w *writer) flush(n int) error {
-	idx := w.written / len(w.buf)
-	_, err := w.ctx.Exec(`
+	idx := int(w.written / uint64(len(w.buf)))
+	query := `
 	INSERT INTO
 		entries_data
 	(
@@ -73,7 +97,16 @@ func (w *writer) flush(n int) error {
 		chunk_index,
 		chunk
 	)
-	VALUES(?,?,?)`, w.entryID, idx, w.buf[0:n])
+	VALUES(?,?,?)`
+	if w.updateExisting {
+		query += `
+	ON CONFLICT(id, chunk_index) DO UPDATE SET chunk=excluded.chunk`
+	}
+
+	_, err := w.ctx.Exec(query,
+		w.entryID,
+		idx,
+		w.buf[0:n])
 
 	return err
 }

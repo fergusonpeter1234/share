@@ -13,11 +13,54 @@ func (s Store) Purge() error {
 		return err
 	}
 
+	if err := s.deleteStaleUploads(); err != nil {
+		return err
+	}
+
 	if err := s.deleteOrphanedRows(); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (s Store) deleteStaleUploads() error {
+	log.Printf("deleting stale entry uploads from database")
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+			log.Printf("failed to rollback stale upload cleanup: %v", err)
+		}
+	}()
+
+	staleBefore := formatTime(s.now().Add(-pendingUploadLifetime))
+	if _, err := tx.Exec(`
+	DELETE FROM
+		entries_data
+	WHERE
+		id IN (
+			SELECT id
+			FROM entries
+			WHERE upload_state = 'pending' AND upload_time < :stale_before
+		)`, sql.Named("stale_before", staleBefore)); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+	DELETE FROM
+		entries
+	WHERE
+		upload_state = 'pending' AND upload_time < :stale_before`,
+		sql.Named("stale_before", staleBefore)); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (s Store) deleteExpiredEntries() error {

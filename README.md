@@ -153,6 +153,10 @@ These clients are built and maintained by third parties, not by the PicoShare pr
 
 ## Tips and tricks
 
+### Large uploads behind a reverse proxy
+
+The web interface automatically uploads files larger than 50 MiB in sequential 50 MiB chunks. This keeps each request below the request-size limits used by services such as Cloudflare while preserving the original file bytes and metadata.
+
 ### Reclaiming reserved database space
 
 Some users find it surprising that when they delete files from PicoShare, they don't gain back free space on their filesystem.

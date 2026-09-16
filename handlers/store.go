@@ -4,6 +4,7 @@ import (
 	"io"
 
 	"github.com/mtlynch/picoshare/picoshare"
+	"github.com/mtlynch/picoshare/store"
 )
 
 type Store interface {
@@ -11,6 +12,8 @@ type Store interface {
 	ReadEntryFile(picoshare.EntryID) (io.ReadSeeker, error)
 	GetEntryMetadata(id picoshare.EntryID) (picoshare.UploadMetadata, error)
 	InsertEntry(reader io.Reader, metadata picoshare.UploadMetadata) error
+	StartEntryUpload(metadata picoshare.UploadMetadata) error
+	AppendEntryUpload(store.EntryUploadChunk) (bool, error)
 	UpdateEntryMetadata(id picoshare.EntryID, metadata picoshare.UploadMetadata) error
 	DeleteEntry(id picoshare.EntryID) error
 	GetGuestLink(picoshare.GuestLinkID) (picoshare.GuestLink, error)

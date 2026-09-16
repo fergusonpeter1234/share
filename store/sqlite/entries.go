@@ -32,7 +32,9 @@ func (s Store) GetEntriesMetadata() ([]picoshare.UploadMetadata, error) {
 				entries_data
 			GROUP BY
 				id
-		) sizes ON entries.id = sizes.id`)
+		) sizes ON entries.id = sizes.id
+	WHERE
+		entries.upload_state = 'complete'`)
 	if err != nil {
 		return []picoshare.UploadMetadata{}, err
 	}
@@ -118,7 +120,8 @@ func (s Store) GetEntryMetadata(id picoshare.EntryID) (picoshare.UploadMetadata,
 				id
 		) sizes ON entries.id = sizes.id
 	WHERE
-		entries.id = :entry_id`, sql.Named("entry_id", id)).Scan(&filename, &note, &contentType, &uploadTimeRaw, &expirationTimeRaw, &fileSizeRaw, &guestLinkID)
+		entries.id = :entry_id AND
+		entries.upload_state = 'complete'`, sql.Named("entry_id", id)).Scan(&filename, &note, &contentType, &uploadTimeRaw, &expirationTimeRaw, &fileSizeRaw, &guestLinkID)
 	if err == sql.ErrNoRows {
 		return picoshare.UploadMetadata{}, store.EntryNotFoundError{ID: id}
 	} else if err != nil {
@@ -216,7 +219,8 @@ func (s Store) UpdateEntryMetadata(id picoshare.EntryID, metadata picoshare.Uplo
 		expiration_time = :expiration_time,
 		note = :note
 	WHERE
-		id = :entry_id`,
+		id = :entry_id AND
+		upload_state = 'complete'`,
 		sql.Named("filename", metadata.Filename),
 		sql.Named("expiration_time", formatExpirationTime(metadata.Expires)),
 		sql.Named("note", metadata.Note.Value),
